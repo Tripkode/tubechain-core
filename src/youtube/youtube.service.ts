@@ -1,68 +1,27 @@
 import { Injectable, BadRequestException, InternalServerErrorException } from '@nestjs/common';
-import { Innertube } from 'youtubei.js';
 import { VideoInfo, DownloadResponse } from './interfaces/video-info.interface';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
+
+const execAsync = promisify(exec);
 
 @Injectable()
 export class YoutubeService {
-  private youtube: Innertube;
   private readonly MAX_RETRIES = 3;
   private readonly RETRY_DELAY = 1000;
-
-  // Pool de configuraciones para rotar y evitar detección
-  private readonly CLIENT_CONFIGS = [
-    {
-      lang: 'en',
-      location: 'US',
-      client_name: 'WEB',
-      client_version: '2.20241205.07.00'
-    },
-    {
-      lang: 'es',
-      location: 'ES',
-      client_name: 'WEB',
-      client_version: '2.20241205.07.00'
-    },
-    {
-      lang: 'en',
-      location: 'GB',
-      client_name: 'ANDROID',
-      client_version: '19.50.45'
-    }
-  ];
-
-  private currentConfigIndex = 0;
+  private readonly TEMP_DIR = path.join(process.cwd(), 'temp');
+  private readonly YTDLP_TIMEOUT = 300000; // 5 minutos timeout
 
   constructor() {
-    this.initializeYoutube();
+    this.ensureTempDir();
   }
 
-  private getNextConfig() {
-    const config = this.CLIENT_CONFIGS[this.currentConfigIndex];
-    this.currentConfigIndex = (this.currentConfigIndex + 1) % this.CLIENT_CONFIGS.length;
-    return config;
-  }
-
-  private async initializeYoutube(): Promise<void> {
-    try {
-      const config = this.getNextConfig();
-      
-      // Inicialización simple sin fetch personalizado para evitar errores de headers
-      this.youtube = await Innertube.create({
-        lang: config.lang,
-        location: config.location,
-        enable_session_cache: false
-      });
-      
-      console.log(`YouTube client inicializado con configuración: ${config.client_name} ${config.location}`);
-    } catch (error) {
-      console.error('Error inicializando YouTube client:', error);
-      throw new InternalServerErrorException('Error inicializando el servicio de YouTube');
+  private ensureTempDir(): void {
+    if (!fs.existsSync(this.TEMP_DIR)) {
+      fs.mkdirSync(this.TEMP_DIR, { recursive: true });
     }
-  }
-
-  private async retryInitialization(): Promise<void> {
-    console.log('Reintentando inicialización del cliente YouTube con nueva configuración...');
-    await this.initializeYoutube();
   }
 
   private extractVideoId(url: string): string {
@@ -110,105 +69,154 @@ export class YoutubeService {
       .substring(0, 200);
   }
 
-  private parseDuration(durationText: string): number {
-    if (!durationText) return 0;
-
-    const match = durationText.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
-    if (!match) return 0;
-
-    const hours = parseInt(match[1] || '0', 10);
-    const minutes = parseInt(match[2] || '0', 10);
-    const seconds = parseInt(match[3] || '0', 10);
-
-    return hours * 3600 + minutes * 60 + seconds;
-  }
-
   private delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  private selectBestFormat(formats: any[]): any {
-    if (!formats || formats.length === 0) {
-      throw new BadRequestException('No hay formatos disponibles');
+  private parseYoutubeDlDuration(duration: string | number): number {
+    if (typeof duration === 'number') {
+      return duration;
     }
 
-    // Filtrar formatos de video válidos con audio (formato completo)
-    let videoFormats = formats.filter(format => {
-      const isVideoWithAudio = format.mime_type?.includes('video/mp4') && 
-                              format.has_video && 
-                              format.has_audio &&
-                              (format.url || format.signatureCipher);
-      return isVideoWithAudio;
-    });
+    if (!duration) return 0;
 
-    // Si no hay formatos con audio, buscar solo video
-    if (videoFormats.length === 0) {
-      videoFormats = formats.filter(format => {
-        const isVideo = format.mime_type?.includes('video/mp4') && 
-                       format.has_video !== false &&
-                       (format.url || format.signatureCipher);
-        return isVideo;
-      });
-    }
-
-    if (videoFormats.length === 0) {
-      throw new BadRequestException('No se encontraron formatos de video compatibles');
-    }
-
-    // Ordenar por calidad (MAYOR a MENOR)
-    const sortedFormats = videoFormats.sort((a, b) => {
-      // Prioridad 1: Resolución
-      const heightA = a.height || 0;
-      const heightB = b.height || 0;
-      if (heightA !== heightB) {
-        return heightB - heightA; // Mayor resolución primero
+    // Formato: "PT4M33S" o "4:33" o números
+    if (typeof duration === 'string') {
+      // Formato ISO 8601 (PT4M33S)
+      const isoMatch = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+      if (isoMatch) {
+        const hours = parseInt(isoMatch[1] || '0', 10);
+        const minutes = parseInt(isoMatch[2] || '0', 10);
+        const seconds = parseInt(isoMatch[3] || '0', 10);
+        return hours * 3600 + minutes * 60 + seconds;
       }
 
-      // Prioridad 2: Bitrate
-      const bitrateA = a.bitrate || 0;
-      const bitrateB = b.bitrate || 0;
-      if (bitrateA !== bitrateB) {
-        return bitrateB - bitrateA;
+      // Formato MM:SS o HH:MM:SS
+      const timeMatch = duration.match(/^(?:(\d+):)?(\d+):(\d+)$/);
+      if (timeMatch) {
+        const hours = parseInt(timeMatch[1] || '0', 10);
+        const minutes = parseInt(timeMatch[2], 10);
+        const seconds = parseInt(timeMatch[3], 10);
+        return hours * 3600 + minutes * 60 + seconds;
       }
 
-      // Prioridad 3: FPS
-      const fpsA = a.fps || 0;
-      const fpsB = b.fps || 0;
-      return fpsB - fpsA;
-    });
+      // Si es un número como string
+      const numMatch = duration.match(/^\d+$/);
+      if (numMatch) {
+        return parseInt(duration, 10);
+      }
+    }
 
-    console.log(`\n=== FORMATOS DISPONIBLES (${sortedFormats.length}) ===`);
-    sortedFormats.forEach((format, index) => {
-      const quality = format.quality_label || `${format.height}p` || 'N/A';
-      const hasAudio = format.has_audio ? '🔊' : '🔇';
-      const bitrate = format.bitrate ? `${Math.round(format.bitrate / 1000)}kbps` : 'N/A';
-      console.log(`${index + 1}. ${quality} ${hasAudio} - ${bitrate} - ${format.mime_type}`);
-    });
-
-    const bestFormat = sortedFormats[0];
-    const selectedQuality = bestFormat.quality_label || `${bestFormat.height}p` || 'Desconocida';
-    console.log(`\n✅ SELECCIONADO: ${selectedQuality} (${bestFormat.mime_type})`);
-    
-    return bestFormat;
+    return 0;
   }
 
-  // Método mejorado para obtener información del video con múltiples intentos
-  private async getVideoInfo(videoId: string): Promise<any> {
-    const methods = [
-      () => this.youtube.getBasicInfo(videoId),
-      () => this.youtube.getInfo(videoId),
-    ];
+  private escapeShellArg(arg: string): string {
+    return `'${arg.replace(/'/g, "'\\''")}'`;
+  }
 
-    for (const method of methods) {
-      try {
-        const info = await method();
-        if (info) return info;
-      } catch (error) {
-        console.log(`Método de información falló: ${error.message}`);
+  private async executeYtDlp(command: string): Promise<string> {
+    try {
+      const { stdout, stderr } = await execAsync(command, {
+        timeout: this.YTDLP_TIMEOUT,
+        maxBuffer: 1024 * 1024 * 10, // 10MB buffer
+        cwd: this.TEMP_DIR
+      });
+
+      if (stderr && !stderr.includes('WARNING')) {
+        console.warn('yt-dlp stderr:', stderr);
       }
+
+      return stdout;
+    } catch (error) {
+      console.error('Error ejecutando yt-dlp:', error.message);
+      throw new Error(`Error ejecutando yt-dlp: ${error.message}`);
+    }
+  }
+
+  private async getVideoInfo(url: string): Promise<any> {
+    try {
+      console.log('🔍 Obteniendo información del video...');
+
+      const escapedUrl = this.escapeShellArg(url);
+      const command = `yt-dlp -j --no-check-certificate --no-warnings ${escapedUrl}`;
+
+      const stdout = await this.executeYtDlp(command);
+
+      if (!stdout.trim()) {
+        throw new Error('No se pudo obtener información del video');
+      }
+
+      const info = JSON.parse(stdout.trim());
+
+      if (info.format_id && !info.formats.some(f => f.format_id === info.format_id)) {
+        info.formats.unshift({
+          format_id: info.format_id,
+          vcodec: info.vcodec,
+          acodec: info.acodec,
+          ext: info.ext,
+          height: info.height,
+          container: info.container,
+        });
+      }
+
+      if (!info) {
+        throw new Error('No se pudo parsear la información del video');
+      }
+
+      console.log('✅ Información obtenida exitosamente');
+      return info;
+
+    } catch (error) {
+      console.error('❌ Error obteniendo información:', error.message);
+      throw new BadRequestException(`Error obteniendo información del video: ${error.message}`);
+    }
+  }
+
+  private selectBestFormat(formats: any[]): string {
+    const hdCombined = formats.filter(f => f.vcodec !== 'none' && f.acodec !== 'none' && f.height >= 720);
+
+    if (hdCombined.length) return hdCombined[0].format_id;
+
+    const sdCombined = formats.filter(f =>
+      f.vcodec !== 'none' && f.acodec !== 'none' && f.height < 720
+    );
+
+    if (sdCombined.length) return sdCombined[0].format_id;
+
+    if (!formats || formats.length === 0) {
+      return 'best[ext=mp4]'; // Formato por defecto
     }
 
-    throw new BadRequestException('No se pudo obtener información del video');
+    console.log(`📊 Analizando ${formats.length} formatos disponibles`);
+
+    const preferredCodecs = ['vp09', 'av01', 'avc1'];
+
+    // Buscar formatos con video y audio (legacy)
+    const combinedFormats = formats.filter(f =>
+      f.vcodec !== 'none' && f.acodec !== 'none' &&
+      (f.ext === 'mp4' || f.container === 'mp4')
+    );
+
+    if (combinedFormats.length > 0) {
+      const best = combinedFormats.sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+      console.log(`✅ Formato seleccionado: ${best.format_id} (${best.height}p, con audio)`);
+      return best.format_id;
+    }
+
+    // Si no hay formatos combinados, usar formato adaptativo
+    const videoFormats = formats.filter(f =>
+      f.vcodec !== 'none' && (f.ext === 'mp4' || f.container === 'mp4')
+    );
+
+    if (videoFormats.length > 0) {
+      const bestVideo = videoFormats.sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+      console.log(`⚠️ Formato seleccionado: ${bestVideo.format_id} (${bestVideo.height}p, video+audio por separado)`);
+      return `${bestVideo.format_id}+bestaudio[ext=m4a]/best[ext=mp4]`;
+    }
+
+    // Fallback a mejor calidad disponible
+    console.log('⚠️ Usando formato por defecto');
+    return 'best[ext=mp4]/best';
   }
 
   async downloadVideo(url: string): Promise<DownloadResponse> {
@@ -218,136 +226,101 @@ export class YoutubeService {
       try {
         console.log(`\n🔄 INTENTO ${attempt}/${this.MAX_RETRIES}`);
 
-        if (!this.youtube) {
-          await this.initializeYoutube();
-        }
-
         const videoId = this.extractVideoId(url);
         console.log(`📺 Video ID: ${videoId}`);
 
         // Obtener información del video
-        const videoInfo = await this.getVideoInfo(videoId);
+        const videoInfo = await this.getVideoInfo(url);
 
         // Verificar disponibilidad
-        if (videoInfo.playability_status?.status === 'UNPLAYABLE') {
-          throw new BadRequestException(
-            `Video no disponible: ${videoInfo.playability_status.reason || 'Razón desconocida'}`
-          );
+        if (videoInfo.availability && videoInfo.availability !== 'public') {
+          throw new BadRequestException(`Video no disponible: ${videoInfo.availability}`);
         }
-
-        // Obtener formatos
-        const adaptiveFormats = videoInfo.streaming_data?.adaptive_formats || [];
-        const legacyFormats = videoInfo.streaming_data?.formats || [];
-        const allFormats = [...legacyFormats, ...adaptiveFormats]; // Priorizar formatos legacy (con audio)
-
-        if (allFormats.length === 0) {
-          throw new BadRequestException('No se encontraron formatos de descarga');
-        }
-
-        console.log(`📊 Total de formatos: ${allFormats.length}`);
 
         // Seleccionar mejor formato
-        const bestFormat = this.selectBestFormat(allFormats);
+        const formatSelector = this.selectBestFormat(videoInfo.formats || []);
+        console.log(`🎯 Selector de formato: ${formatSelector}`);
 
-        // Descargar usando múltiples métodos
-        let buffer: Buffer;
-        let downloadMethod = 'Desconocido';
+        // Configurar nombre de archivo
+        const outputTemplate = `${videoId}_%(format_id)s.%(ext)s`;
 
-        try {
-          // Método 1: Descarga integrada de youtubei.js
-          console.log('\n🔽 Método 1: Descarga integrada...');
-          const stream = await this.youtube.download(videoId, {
-            type: 'video+audio', // Priorizar video con audio
-            quality: 'best',
-            format: 'mp4'
-          });
+        // Escapar argumentos para shell
+        const escapedUrl = this.escapeShellArg(url);
+        const escapedFormat = this.escapeShellArg(formatSelector);
+        const escapedOutput = this.escapeShellArg(outputTemplate);
 
-          const chunks: Buffer[] = [];
-          const reader = stream.getReader();
-          
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (value) {
-              chunks.push(Buffer.from(value));
-            }
-          }
+        // Construir comando de descarga
+        const downloadCommand = `yt-dlp -f ${escapedFormat} -o ${escapedOutput} --no-check-certificate --no-warnings --prefer-free-formats ${escapedUrl}`;
 
-          buffer = Buffer.concat(chunks);
-          downloadMethod = 'Integrada';
-          
-        } catch (downloadError) {
-          console.log(`❌ Método 1 falló: ${downloadError.message}`);
-          
-          // Método 2: Descarga directa con URL
-          if (bestFormat.url) {
-            console.log('🔽 Método 2: Descarga directa...');
-            
-            // Headers mínimos para evitar problemas
-            const response = await fetch(bestFormat.url, {
-              method: 'GET',
-              headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': 'https://www.youtube.com/',
-                'Origin': 'https://www.youtube.com'
-              }
-            });
-            
-            if (!response.ok) {
-              throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-            }
-            
-            const arrayBuffer = await response.arrayBuffer();
-            buffer = Buffer.from(arrayBuffer);
-            downloadMethod = 'Directa';
-            
-          } else {
-            throw new Error('No hay URL de descarga disponible');
-          }
+        console.log('🔽 Iniciando descarga...');
+
+        // Realizar descarga
+        await this.executeYtDlp(downloadCommand);
+
+        // Buscar el archivo descargado
+        const files = fs.readdirSync(this.TEMP_DIR).filter(file =>
+          file.startsWith(videoId) && (file.endsWith('.mp4') || file.endsWith('.webm') || file.endsWith('.mkv'))
+        );
+
+        if (files.length === 0) {
+          throw new Error('No se encontró el archivo descargado');
         }
+
+        const downloadedFile = files[0];
+        const filePath = path.join(this.TEMP_DIR, downloadedFile);
+
+        // Verificar que el archivo existe y tiene contenido
+        if (!fs.existsSync(filePath)) {
+          throw new Error('El archivo descargado no existe');
+        }
+
+        const stats = fs.statSync(filePath);
+        if (stats.size === 0) {
+          throw new Error('El archivo descargado está vacío');
+        }
+
+        // Leer archivo como buffer
+        const buffer = fs.readFileSync(filePath);
+
+        // Limpiar archivo temporal
+        fs.unlinkSync(filePath);
 
         if (!buffer || buffer.length === 0) {
           throw new Error('Buffer de descarga vacío');
         }
 
         // Procesar información del video
-        const basicInfo = videoInfo.basic_info || {};
-        const durationRaw = basicInfo.duration;
-        const durationSeconds = typeof durationRaw === 'number'
-          ? durationRaw
-          : this.parseDuration(typeof durationRaw === 'string' ? durationRaw : '0');
+        const duration = this.parseYoutubeDlDuration(videoInfo.duration);
 
         const videoInfoResponse: VideoInfo = {
-          id: basicInfo.id || videoId,
-          title: this.sanitizeForHeader(basicInfo.title || 'Sin título'),
-          description: this.sanitizeForHeader(basicInfo.short_description || 'Sin descripción'),
-          duration: durationSeconds,
-          durationFormatted: this.formatDuration(durationSeconds),
-          thumbnail: basicInfo.thumbnail?.[0]?.url || '',
+          id: videoInfo.id || videoId,
+          title: this.sanitizeForHeader(videoInfo.title || 'Sin título'),
+          description: this.sanitizeForHeader(videoInfo.description || 'Sin descripción'),
+          duration: duration,
+          durationFormatted: this.formatDuration(duration),
+          thumbnail: videoInfo.thumbnail || videoInfo.thumbnails?.[0]?.url || '',
           author: {
-            name: this.sanitizeForHeader(basicInfo.author || 'Desconocido'),
-            channelId: basicInfo.channel_id || '',
+            name: this.sanitizeForHeader(videoInfo.uploader || videoInfo.channel || 'Desconocido'),
+            channelId: videoInfo.channel_id || videoInfo.uploader_id || '',
           },
-          viewCount: basicInfo.view_count || 0,
-          uploadDate: basicInfo.start_timestamp?.toISOString() || 
-                     basicInfo.end_timestamp?.toISOString() || 
-                     new Date().toISOString(),
-          quality: bestFormat.quality_label || `${bestFormat.height}p` || 'Mejor disponible',
-          format: 'mp4',
+          viewCount: videoInfo.view_count || 0,
+          uploadDate: videoInfo.upload_date
+            ? new Date(videoInfo.upload_date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3')).toISOString()
+            : new Date().toISOString(),
+          quality: videoInfo.height ? `${videoInfo.height}p` : 'Mejor disponible',
+          format: videoInfo.ext || 'mp4',
           fileSize: buffer.length,
         };
 
         const filename = this.sanitizeFilename(
-          `${videoInfoResponse.title}_${videoInfoResponse.quality}.mp4`
+          `${videoInfoResponse.title}_${videoInfoResponse.quality}.${videoInfoResponse.format}`
         );
 
         const response: DownloadResponse = {
           success: true,
           videoInfo: videoInfoResponse,
           downloadBuffer: buffer,
-          contentType: 'video/mp4',
+          contentType: `video/${videoInfoResponse.format}`,
           filename,
         };
 
@@ -355,9 +328,9 @@ export class YoutubeService {
         console.log(`\n✅ DESCARGA EXITOSA`);
         console.log(`📁 Archivo: ${filename}`);
         console.log(`📏 Tamaño: ${fileSizeMB} MB`);
-        console.log(`🔧 Método: ${downloadMethod}`);
         console.log(`🎯 Calidad: ${videoInfoResponse.quality}`);
-        
+        console.log(`📹 Formato: ${videoInfoResponse.format}`);
+
         return response;
 
       } catch (error) {
@@ -372,13 +345,6 @@ export class YoutubeService {
           const delayTime = this.RETRY_DELAY * attempt;
           console.log(`⏳ Esperando ${delayTime}ms antes del siguiente intento...`);
           await this.delay(delayTime);
-          
-          // Reinicializar con nueva configuración
-          try {
-            await this.retryInitialization();
-          } catch (reinitError) {
-            console.error('Error reinicializando:', reinitError.message);
-          }
         }
       }
     }
@@ -388,19 +354,54 @@ export class YoutubeService {
     );
   }
 
-  async healthCheck(): Promise<{ status: string; version?: string; config?: string }> {
+  async healthCheck(): Promise<{ status: string; version?: string; backend?: string; error?: string }> {
     try {
-      if (!this.youtube) {
-        await this.initializeYoutube();
-      }
-      const currentConfig = this.CLIENT_CONFIGS[this.currentConfigIndex];
-      return { 
-        status: 'OK', 
-        version: '14.0.0',
-        config: `${currentConfig.client_name}-${currentConfig.location}`
+      // Verificar que yt-dlp esté disponible
+      const stdout = await this.executeYtDlp('yt-dlp --version');
+      return {
+        status: 'OK',
+        version: stdout.trim(),
+        backend: 'yt-dlp nativo'
       };
     } catch (error) {
-      return { status: 'ERROR' };
+      console.error('Health check failed:', error.message);
+      return {
+        status: 'ERROR',
+        backend: 'yt-dlp nativo',
+        error: error.message
+      };
+    }
+  }
+
+  // Método para limpiar archivos temporales antiguos
+  async cleanTempFiles(): Promise<void> {
+    try {
+      const files = fs.readdirSync(this.TEMP_DIR);
+      const now = Date.now();
+      const oneHour = 60 * 60 * 1000;
+
+      for (const file of files) {
+        const filePath = path.join(this.TEMP_DIR, file);
+        const stats = fs.statSync(filePath);
+
+        if (now - stats.mtime.getTime() > oneHour) {
+          fs.unlinkSync(filePath);
+          console.log(`🗑️ Archivo temporal eliminado: ${file}`);
+        }
+      }
+    } catch (error) {
+      console.error('Error limpiando archivos temporales:', error.message);
+    }
+  }
+
+  // Método para verificar si yt-dlp está instalado
+  async checkYtDlpInstallation(): Promise<boolean> {
+    try {
+      await this.executeYtDlp('which yt-dlp');
+      return true;
+    } catch (error) {
+      console.error('yt-dlp no está instalado o no está en el PATH');
+      return false;
     }
   }
 }
