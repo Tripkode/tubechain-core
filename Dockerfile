@@ -84,7 +84,7 @@ RUN echo '#!/bin/sh' > start.sh && \
     echo 'echo "🎬 Verificando yt-dlp..."' >> start.sh && \
     echo 'yt-dlp --version || echo "⚠️ yt-dlp no disponible"' >> start.sh && \
     echo 'echo "🎯 Iniciando servidor NestJS..."' >> start.sh && \
-    echo 'exec node dist/src/main.js' >> start.sh && \
+    echo 'exec node dist/main.js' >> start.sh && \
     chmod +x start.sh
 
 # Use exec form for better signal handling
